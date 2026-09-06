@@ -8,13 +8,20 @@ searcher.py —— 检索Agent
 
 【数据源架构（重要的工程决策记录）】
   实测本机网络环境（2026-09-03）:
-    - api.openalex.org   —— 稳定可达，免密钥，全学科2.5亿作品
+    - api.semanticscholar.org —— 认证密钥已下发(2026-09-06)，
+      1次/秒独享额度，稳定可达
+    - api.openalex.org   —— 稳定可达但免费额度仅$0.1/天(约100次
+      请求)，耗尽后429持续到UTC午夜，只适合低量请求
     - export.arxiv.org   —— 时通时断（间歇性阻断）
-    - api.semanticscholar.org —— 可达但匿名429限流严重
-  因此采用【三级数据源容错】架构:
-    主源: OpenAlex（快、稳、覆盖全学科、自带OA全文链接+被引数排序）
-    兜底1: arXiv官方API（CS/物理领域元数据质量高）
-    兜底2: Semantic Scholar（最后防线）
+  因此采用【S2主源 + OpenAlex引用链专用 + arXiv兜底】架构
+  （2026-09-06调整，此前是OpenAlex主源，但每天跑1-2次流水线
+  就烧穿额度导致429卡死）:
+    主源: Semantic Scholar认证模式（稳定1req/s，元数据质量高，
+          自带citationCount被引数）
+    专用: OpenAlex只承担引用链挖掘+经典注入（它的referenced_works
+          引用图谱是独有能力，检索主任务不再依赖它；额度耗尽时
+          熔断器自动跳过这两路，流水线不受阻）
+    兜底: arXiv官方API（S2不可用时的最后防线）
     下载: 优先OA PDF直链，无直链时回落到 arxiv.org/pdf/{id}
 
 【OpenAlex额度坑（2026-09-04实测教训，重要！）】
@@ -52,9 +59,10 @@ class RelevanceScores(BaseModel):
     )
 
 
-# Semantic Scholar API 配置
+# Semantic Scholar API 配置（主数据源）
+# citationCount: 被引数（影响力加成信号，替代OpenAlex的cited_by_count）
 S2_API_BASE = "https://api.semanticscholar.org/graph/v1/paper/search"
-S2_FIELDS = "title,abstract,year,authors,externalIds,openAccessPdf"
+S2_FIELDS = "title,abstract,year,authors,externalIds,openAccessPdf,citationCount"
 
 # arXiv官方API配置
 ARXIV_API_BASE = "http://export.arxiv.org/api/query"
@@ -785,18 +793,33 @@ def _s2_request(params: dict, max_retries: int = 3) -> dict | None:
     return None
 
 
-def _s2_search(kw: str, limit: int) -> list[PaperMeta]:
+def _s2_search(kw: str, limit: int, year_from: int | None = None) -> list[PaperMeta]:
     """
-    调用Semantic Scholar检索单个关键词（兜底数据源）
+    调用Semantic Scholar检索单个关键词（主数据源，认证模式）
 
-    只保留有arXiv编号且提供了开放获取PDF链接的论文
+    认证密钥(2026-09-06下发)后1 req/s独享，稳定不再匿名429。
+    citationCount被引数填充到cited_by（影响力加成+综合排序需要）。
+
+    年份过滤: S2的year参数支持区间格式"2021-2026"，
+    与OpenAlex的from_publication_date等价。
+
+    只保留有arXiv编号且提供了摘要的论文
     （本项目后续步骤需要从PDF提取全文，无法下载的论文没有价值）
+
+    返回:
+        PaperMeta列表；网络失败返回空列表（由上层切换兜底数据源）
     """
-    data = _s2_request({
+    params = {
         "query": kw,
         "limit": limit,
         "fields": S2_FIELDS,
-    })
+    }
+    if year_from:
+        import datetime
+        params["year"] = (f"{year_from}-"
+                          f"{datetime.date.today().year}")
+
+    data = _s2_request(params)
     if data is None:
         return []
 
@@ -814,13 +837,57 @@ def _s2_search(kw: str, limit: int) -> list[PaperMeta]:
             year=item.get("year") or 0,
             abstract=abstract.replace("\n", " ").strip(),
             pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",  # 仍从arxiv下载
+            cited_by=item.get("citationCount") or 0,  # S2被引数（影响力信号）
         ))
     return papers
 
 
 # ---------------------------------------------------------------
-# 第1段：统一检索入口（OpenAlex主源 → arXiv → S2 三级容错）
+# 第1段：统一检索入口（S2主源 → OpenAlex → arXiv 三级容错）
 # ---------------------------------------------------------------
+def _resolve_openalex_ids(papers: list[PaperMeta], limit: int = 12) -> int:
+    """
+    为S2/arXiv检索结果补齐OpenAlex ID（引用链挖掘的种子前置条件）
+
+    背景: 引用链挖掘依赖OpenAlex的referenced_works引用图谱，
+    但S2主源的结果只有arXiv ID。按标题反查OpenAlex逐篇解析
+    （每篇1个请求，limit封顶；OpenAlex额度耗尽时熔断器让
+    _oa_request直接返回None，解析自动中断，流水线不受阻）。
+
+    返回:
+        成功解析出openalex_id的论文数
+    """
+    from difflib import SequenceMatcher
+
+    resolved = 0
+    for p in papers:
+        if resolved >= limit:
+            break
+        if p.openalex_id:
+            continue
+        data = _oa_request({
+            "filter": f"title.search:{p.title}",
+            "per_page": 3,
+            "select": "id,title,cited_by_count",
+        })
+        if data is None:
+            # 熔断中或查询失败: 放弃剩余解析（后续种子同样会失败）
+            break
+        best, best_score = None, 0.0
+        norm = _norm_title(p.title)
+        for work in data.get("results", []):
+            score = SequenceMatcher(
+                None, norm, _norm_title(work.get("title") or "")).ratio()
+            if score > best_score:
+                best, best_score = work, score
+        # 标题相似度门槛: 防止把别的论文的引用图谱接错种子
+        if best is not None and best_score >= 0.85:
+            p.openalex_id = (best.get("id") or "").split("/")[-1]
+            resolved += 1
+    return resolved
+
+
+
 def _parse_year_from(inclusion_criteria: str) -> int | None:
     """
     从筛选条件文本里解析年份下限
@@ -887,7 +954,9 @@ def search(plan: SearchPlan, results_per_query: int = 10) -> list[PaperMeta]:
       rrf(paper) = Σ_各路 1/(K + rank)   K=60（原论文推荐值）
       再叠加多关键词命中加成: 被 n 个检索词命中 ×(1 + 0.5*(n-1))
       ——多篇论文被多个不同角度的检索词共同命中，是强相关信号
-    数据源容错: OpenAlex双路全失败时才降级 arXiv -> S2 单路检索。
+    数据源容错（2026-09-06起S2为首选）: S2认证模式失败时降级
+    OpenAlex -> arXiv 单路检索。引用链挖掘始终尝试走OpenAlex
+    （S2结果需先解析OpenAlex ID），额度耗尽时熔断自动跳过。
 
     返回:
         按RRF融合分降序的PaperMeta列表（已去重，rrf_score/cited_by/
@@ -909,30 +978,34 @@ def search(plan: SearchPlan, results_per_query: int = 10) -> list[PaperMeta]:
         # 注意: 旧版bug是cited_res只在第一个关键词赋值，后续关键词
         # 复用kw1的旧结果导致cited路"从未真正执行"（Surrogate
         # Gradient被引149却显示被引0的根因，2026-09-04修复）
-        if source is None or source == "openalex":
-            cited_res = _openalex_search(kw, results_per_query, year_from,
-                                         sort_mode="cited")
+        # 优先级(2026-09-06): S2认证(稳定1req/s) -> OpenAlex($0.1/天
+        # 额度易烧穿) -> arXiv(间歇性阻断)
+        if source is None or source == "s2":
+            cited_res = _s2_search(kw, results_per_query, year_from)
             if source is None:
                 if cited_res:
-                    source = "openalex"
-                    print(f"[检索Agent] 数据源选定: OpenAlex双路检索"
-                          f"{f'(年份下限{year_from})' if year_from else ''}")
+                    source = "s2"
+                    print(f"[检索Agent] 数据源选定: Semantic Scholar"
+                          f"(认证模式"
+                          f"{f', 年份下限{year_from}' if year_from else ''})")
                 else:
-                    # 降级: arXiv单路
-                    arxiv_res = _arxiv_search(kw, results_per_query)
-                    if arxiv_res:
-                        source = "arxiv"
-                        print("[检索Agent] OpenAlex不可用, "
-                              "数据源切换: arXiv官方API")
+                    # 降级: OpenAlex双路
+                    cited_res = _openalex_search(kw, results_per_query,
+                                                 year_from, sort_mode="cited")
+                    if cited_res:
+                        source = "openalex"
+                        print("[检索Agent] S2不可用, 数据源切换: "
+                              "OpenAlex双路检索")
                     else:
-                        source = "s2"
-                        print("[检索Agent] 数据源切换: Semantic Scholar")
-                    cited_res = arxiv_res or _s2_search(kw,
-                                                        results_per_query)
-        elif source == "arxiv":
-            cited_res = _arxiv_search(kw, results_per_query)
+                        source = "arxiv"
+                        print("[检索Agent] S2/OpenAlex均不可用, "
+                              "数据源切换: arXiv官方API")
+                        cited_res = _arxiv_search(kw, results_per_query)
+        elif source == "openalex":
+            cited_res = _openalex_search(kw, results_per_query, year_from,
+                                         sort_mode="cited")
         else:
-            cited_res = _s2_search(kw, results_per_query)
+            cited_res = _arxiv_search(kw, results_per_query)
 
         if source == "openalex":
             # ---- 双路检索: 影响力路 + 相关性路 ----
@@ -941,7 +1014,7 @@ def search(plan: SearchPlan, results_per_query: int = 10) -> list[PaperMeta]:
                                        collect_citations=False)
             routes = [("cited", cited_res), ("relevance", rel_res)]
         else:
-            # 降级数据源只有单路（其API自带relevance排序）
+            # S2/arXiv只有单路（其API自带relevance排序）
             routes = [("cited", cited_res)]
 
         for route_name, results in routes:
@@ -981,13 +1054,20 @@ def search(plan: SearchPlan, results_per_query: int = 10) -> list[PaperMeta]:
     # 奠基论文的标题/摘要不含现代检索词（如SpikeProp的摘要里没有
     # "surrogate gradient"），关键词检索存在系统性盲区。从高影响力
     # 种子的参考文献里做共被引统计，被多篇种子共同引用=领域经典。
-    if source == "openalex":
-        # 种子选择: 多关键词命中数(主)+被引数(次)排序——被多个检索
-        # 角度共同命中且高被引的论文最能代表该领域
+    # 该路只能走OpenAlex（referenced_works引用图谱是独有能力）。
+    # S2主源时种子无openalex_id，先按标题反查解析（12篇封顶）；
+    # OpenAlex额度耗尽时熔断器让解析/挖掘自动整体跳过。
+    if source in ("s2", "openalex"):
         seed_pool = sorted(
-            [p for p in seen.values() if p.openalex_id],
+            [p for p in seen.values()],
             key=lambda p: (kw_hit_count.get(p.arxiv_id, 0), p.cited_by),
             reverse=True)
+        if source == "s2":
+            n_resolved = _resolve_openalex_ids(seed_pool)
+            if n_resolved == 0:
+                print("[检索Agent] OpenAlex不可用(熔断/失败)，"
+                      "引用链挖掘与经典注入本轮跳过")
+            seed_pool = [p for p in seed_pool if p.openalex_id]
         chain_papers = _citation_chain_expand(seed_pool)
         chain_added = []  # 新挖出的经典（进入chain路排名）
         for cp in chain_papers:
