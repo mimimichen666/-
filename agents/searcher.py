@@ -774,6 +774,10 @@ def _s2_request(params: dict, max_retries: int = 3) -> dict | None:
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
+            # 官方限流为所有端点合计1次/秒，成功响应后也强制间隔，
+            # 防止流水线其他调用点紧跟着发请求被拒
+            if config.S2_API_KEY:
+                time.sleep(1.1)
             return resp.json()
         except Exception as e:
             print(f"[检索Agent] S2请求异常(第{attempt + 1}次): {e}")
