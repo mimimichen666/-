@@ -8,7 +8,7 @@ searcher.py —— 检索Agent
 
 【数据源架构（重要的工程决策记录）】
   实测本机网络环境（2026-09-03）:
-    - api.openalex.org   —— 稳定可达，免密钥，10万次/天，全学科2.5亿作品
+    - api.openalex.org   —— 稳定可达，免密钥，全学科2.5亿作品
     - export.arxiv.org   —— 时通时断（间歇性阻断）
     - api.semanticscholar.org —— 可达但匿名429限流严重
   因此采用【三级数据源容错】架构:
@@ -16,6 +16,15 @@ searcher.py —— 检索Agent
     兜底1: arXiv官方API（CS/物理领域元数据质量高）
     兜底2: Semantic Scholar（最后防线）
     下载: 优先OA PDF直链，无直链时回落到 arxiv.org/pdf/{id}
+
+【OpenAlex额度坑（2026-09-04实测教训，重要！）】
+  OpenAlex免费额度远比想象的小: $0.1/天(约100次检索请求)，
+  用尽后持续429直到UTC午夜(北京时间次日8点)才重置。
+  引用链挖掘单次运行就要发50-100个请求，当天多跑几次流水线
+  必然烧穿额度。额度耗尽型429的响应体特征:
+    {"message":"Insufficient budget...Resets at midnight UTC"}
+  对这种429做退避重试毫无意义(要等十几个小时)，必须熔断——
+  识别后全局跳过OpenAlex，立即切换arXiv/S2兜底。
 
 输入: SearchPlan（规划Agent的产出）
 输出: list[PaperMeta]（已下载、已过筛的论文列表）
@@ -59,9 +68,37 @@ OPENALEX_UA = "literature-agent/0.1 (mailto:course-project@example.com)"
 # ---------------------------------------------------------------
 # 第1段-A：OpenAlex检索（主数据源）
 # ---------------------------------------------------------------
+# 熔断器全局状态: 当天OpenAlex额度耗尽时置True，本进程内所有
+# OpenAlex请求直接短路返回None（上层自动切换arXiv/S2兜底），
+# 避免对"要等十几小时才重置"的429做无意义的退避重试
+_OA_QUOTA_EXHAUSTED = False
+
+
+def _check_oa_quota_error(resp: requests.Response) -> bool:
+    """
+    识别"额度耗尽"型429（区别于普通的瞬时限流）
+
+    判据（OpenAlex实测响应）:
+      - 响应体含 "Insufficient budget" 或 "Resets at midnight UTC"
+      - Retry-After头 > 3600秒（普通限流通常几十秒）
+    返回True表示额度耗尽，应触发熔断
+    """
+    try:
+        body = resp.text[:300]
+    except Exception:
+        return False
+    if ("Insufficient budget" in body
+            or "Resets at midnight UTC" in body):
+        return True
+    retry_after = resp.headers.get("Retry-After", "")
+    if retry_after.isdigit() and int(retry_after) > 3600:
+        return True
+    return False
+
+
 def _oa_request(params: dict, max_retries: int = 4) -> dict | None:
     """
-    带重试的OpenAlex请求（429自适应退避）
+    带重试的OpenAlex请求（429自适应退避 + 额度熔断）
 
     退避策略（2026-09-04实测教训）:
       引用链挖掘单轮发30-40个请求，触发OpenAlex 429限流后，
@@ -69,9 +106,19 @@ def _oa_request(params: dict, max_retries: int = 4) -> dict | None:
       5→15→30→45秒指数退避，给限流窗口足够的冷却时间；
       4xx参数错误立即放弃（重试无意义）。
 
+    熔断策略（2026-09-04晚实测教训）:
+      OpenAlex免费额度仅$0.1/天(约100次请求)，耗尽后429持续到
+      UTC午夜。这种429响应体带"Insufficient budget"，重试要等
+      十几小时——识别后置全局熔断标志，后续所有OpenAlex请求
+      直接短路，流水线立即切换arXiv/S2兜底继续跑。
+
     返回:
         解析后的JSON dict，彻底失败返回None
     """
+    global _OA_QUOTA_EXHAUSTED
+    if _OA_QUOTA_EXHAUSTED:
+        return None  # 熔断中：当天额度已耗尽，直接走兜底数据源
+
     backoffs = [5, 15, 30, 45]  # 429/5xx退避表(秒)，普通网络错误用短等待
     for attempt in range(max_retries):
         try:
@@ -83,6 +130,13 @@ def _oa_request(params: dict, max_retries: int = 4) -> dict | None:
             return resp.json()
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
+            if code == 429 and e.response is not None and \
+                    _check_oa_quota_error(e.response):
+                # 额度耗尽型429: 熔断，不再重试（重试要等到UTC午夜）
+                _OA_QUOTA_EXHAUSTED = True
+                print("[检索Agent] OpenAlex当日额度已耗尽($0.1/天)，"
+                      "熔断并切换arXiv/S2兜底（北京时间明早8点重置）")
+                return None
             if code == 429 or code >= 500:
                 wait = backoffs[min(attempt, len(backoffs) - 1)]
                 print(f"[检索Agent] OpenAlex限流/服务异常({code})，"
@@ -264,7 +318,12 @@ def _oa_get_work(openalex_id: str,
 
     与_oa_request的区别: 那个查集合端点(/works?filter=...)，
     这个查单个作品端点(/works/W123)，用于拿某篇论文的参考文献列表
+
+    同样受全局熔断器保护（额度耗尽时直接返回None）
     """
+    global _OA_QUOTA_EXHAUSTED
+    if _OA_QUOTA_EXHAUSTED:
+        return None
     url = f"https://api.openalex.org/works/{openalex_id}"
     for attempt in range(3):
         try:
@@ -273,6 +332,16 @@ def _oa_get_work(openalex_id: str,
                                 timeout=30)
             resp.raise_for_status()
             return resp.json()
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+            if code == 429 and e.response is not None and \
+                    _check_oa_quota_error(e.response):
+                _OA_QUOTA_EXHAUSTED = True
+                print("[检索Agent] OpenAlex当日额度已耗尽(单作品查询)，"
+                      "熔断并跳过引用链挖掘")
+                return None
+            print(f"[检索Agent] 单作品查询错误({code})，放弃")
+            return None
         except Exception as e:
             print(f"[检索Agent] 单作品查询异常(第{attempt + 1}次): {e}")
             time.sleep(1.5)
