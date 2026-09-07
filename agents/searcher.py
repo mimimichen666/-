@@ -760,10 +760,15 @@ def _s2_request(params: dict, max_retries: int = 3) -> dict | None:
         无密钥时匿名调用（全球共享池，高峰期429频繁）
 
     重试策略（2026-09-04实测教训）:
-        S2只是兜底数据源（主源OpenAlex失败才轮到它），旧配置
-        10次×60秒=单关键词最多卡10分钟，纯粹拖慢流水线。匿名
-        429时快速放弃（3次×30秒封顶）比死等更优——反正还有
-        LLM粗筛兜底，缺一路候选不至于空手而归。
+        旧配置10次×60秒=单关键词最多卡10分钟，纯粹拖慢流水线，
+        快速放弃比死等更优——还有OpenAlex/arXiv兜底，缺一路候选
+        不至于空手而归。
+
+    429说明（2026-09-07实测）:
+        S2官方文档确认: 即使遵守1 req/s，其共享基础设施负载高时
+        也会对认证用户返回429（官方推荐处理就是退避重试）。
+        实测认证模式429频率不低，因此: (1)尊重Retry-After头;
+        (2)成功后强制2秒间隔（宁慢勿堵，4个关键词总共才多花6秒）。
 
     返回:
         解析后的JSON dict，彻底失败返回None
@@ -775,17 +780,23 @@ def _s2_request(params: dict, max_retries: int = 3) -> dict | None:
             resp = requests.get(S2_API_BASE, params=params,
                                 headers=headers, timeout=30)
             if resp.status_code == 429:
-                wait = 10 * (attempt + 1) if config.S2_API_KEY else 30
+                # 优先尊重服务端给的Retry-After（秒），没有则用退避序列
+                retry_after = resp.headers.get("Retry-After")
+                if config.S2_API_KEY:
+                    wait = (int(retry_after) + 1 if retry_after
+                            else 10 * (attempt + 1))
+                else:
+                    wait = 30
                 mode = "认证" if config.S2_API_KEY else "匿名"
                 print(f"[检索Agent] S2限流(429, {mode}模式)，等待{wait}秒后重试"
                       f"({attempt + 1}/{max_retries})...")
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
-            # 官方限流为所有端点合计1次/秒，成功响应后也强制间隔，
-            # 防止流水线其他调用点紧跟着发请求被拒
+            # 官方限流为所有端点合计1次/秒，且共享负载高时1秒间隔
+            # 也会429（2026-09-07实测），成功后强制2秒间隔宁慢勿堵
             if config.S2_API_KEY:
-                time.sleep(1.1)
+                time.sleep(2)
             return resp.json()
         except Exception as e:
             print(f"[检索Agent] S2请求异常(第{attempt + 1}次): {e}")
