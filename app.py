@@ -485,10 +485,10 @@ if reviews:
                "原文不符的比例（越低越可信）；「可穿透证据」=能点击📎直达"
                "PDF原文高亮处的声明数。详见「📖 新手指南」标签页。")
 
-tabG, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+tabG, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
     ["📖 新手指南", "🔍 检索结果", "📄 信息卡片", "✅ 审查明细", "💬 可信问答",
      "⚡ 学术争议", "📊 综述表格", "🕸 引用图谱", "📝 最终报告",
-     "📚 论文原文"])
+     "📚 论文原文", "🤖 AI助手"])
 
 # ---- 标签页: 新手指南（核心知识解释，面向所有使用者）----
 with tabG:
@@ -514,7 +514,7 @@ with tabG:
 所以报告里的关键结论**可以点击📎按钮跳转到PDF原文高亮处验证**。
 """)
 
-    with st.expander("🗺️ 十个标签页分别看什么？（按推荐阅读顺序）", expanded=True):
+    with st.expander("🗺️ 十一个标签页分别看什么？（按推荐阅读顺序）", expanded=True):
         st.markdown("""
 1. **🔍 检索结果** — 系统找到了哪些论文？为什么这篇排前面？
    每篇的徽章含义：`🔗引用链经典`=被多篇论文共同引用的奠基之作；
@@ -533,6 +533,8 @@ with tabG:
    系统会把报告转写成带背景知识铺垫的通俗版。
 9. **📚 论文原文** — 想亲自读论文？选一篇就在网页里直接阅读PDF全文，
    核对系统说的和论文写的是否一致。
+10. **🤖 AI助手** — 任何疑问直接问：系统怎么用、指标什么含义、
+   论文里某个方法的效果，它都能答（论文内容只基于已核验信息）。
 """)
 
     with st.expander("📚 术语速查表（看不懂某个词就来这里查）", expanded=False):
@@ -1075,3 +1077,135 @@ with tab8:
                 file_name=f"{chosen_id}.pdf",
                 mime="application/pdf",
             )
+
+# ---- 标签9: AI助手（系统使用 + 论文内容 全能问答）----
+with tab9:
+    st.subheader("🤖 AI助手")
+    st.caption("关于**本系统怎么用**、关于**当前检索的论文内容**，"
+               "都可以直接问。回答基于系统说明和当前结果数据生成，"
+               "论文内容类回答仅使用已核验的信息。")
+
+    # 会话状态: 助手对话历史
+    if "assist_history" not in st.session_state:
+        st.session_state.assist_history = []
+
+    # ---- 构建助手的知识上下文（每次对话时按当前数据动态生成）----
+    def _build_assistant_context() -> str:
+        """
+        汇总助手可用的全部背景资料:
+        1. 系统使用说明（怎么跑流水线、各标签页看什么、指标含义）
+        2. 当前结果概况（主题、论文清单、声明池摘要、报告全文）
+        """
+        parts = []
+
+        # 1. 系统说明
+        parts.append(
+            "【系统使用说明】\n"
+            "- 系统定位: 科研文献整理Agent。用户输入研究主题后自动执行"
+            "五段流水线: 规划(生成检索词)→检索(下载论文PDF)→提取(信息卡片)"
+            "→审查(两级防幻觉核验)→综合(综述报告)。另有证据定位(PDF原文"
+            "高亮穿透)和矛盾检测(学术争议发现)两个后处理。\n"
+            "- 操作: 左侧边栏输入研究主题（建议具体，如'脉冲神经网络的"
+            "高效训练方法'），选目标论文数，点'🚀 完整运行'（约10-15分钟，"
+            "运行中勿重复点击）；已有结果点'📂 载入已有结果'。\n"
+            "- 标签页: 📖新手指南(3分钟入门) | 🔍检索结果(四种排序+徽章) | "
+            "📄信息卡片(每篇论文的声明+📎证据原文) | ✅审查明细(每条声明"
+            "核验结果) | 💬可信问答(仅基于声明池、证据不足会拒答) | "
+            "⚡学术争议(论文间矛盾) | 📊综述表格 | 🕸引用图谱 | "
+            "📝最终报告(可生成🍼小白解读) | 📚论文原文(滚动阅读PDF)。\n"
+            "- 关键指标: 声明=从论文摘出的可核实信息；通过核验=引用真实"
+            "且无夸大；幻觉率=AI表述与论文原文不符比例（越低越可信）；"
+            "可穿透证据=能定位到PDF原文高亮处的声明数。\n"
+            "- 徽章含义: 🔗引用链经典(被多篇种子论文共同引用) | "
+            "🔥高被引 | 🤖高度切题(LLM相关性≥4.5)。"
+        )
+
+        # 2. 当前结果数据
+        if papers:
+            topic_cur = st.session_state.run_outputs.get("topic", "")
+            lines = [f"【当前结果概况】"]
+            if topic_cur:
+                lines.append(f"- 检索主题: {topic_cur}")
+            lines.append(f"- 收录论文{len(papers)}篇:")
+            for p in sorted(papers, key=lambda x: x.final_score or 0,
+                            reverse=True)[:15]:
+                lines.append(
+                    f"  {p.title[:70]} ({p.year}, 被引{p.cited_by}, "
+                    f"相关性{p.relevance_score}, arXiv:{p.arxiv_id})"
+                )
+            parts.append("\n".join(lines))
+
+        # 3. 声明池（论文内容的问答依据）
+        try:
+            from agents import qa_agent as _qa
+            pool = _qa.build_claim_pool()
+            if pool:
+                lines = [f"【已核验声明池】(共{len(pool)}条，"
+                         "回答论文内容问题时只能依据这些)"]
+                for c in pool:
+                    lines.append(
+                        f"[声明#{c['num']}] ({c['type']}, "
+                        f"《{c['paper_title']}》{c['year']}年)\n"
+                        f"{c['content']}"
+                    )
+                parts.append("\n".join(lines))
+        except Exception:
+            pass
+
+        # 4. 综述报告（全文）
+        if report_md:
+            parts.append(f"【最终综述报告全文】\n{report_md}")
+
+        return "\n\n".join(parts)
+
+    # 渲染历史对话
+    for msg in st.session_state.assist_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # 输入框（快捷问题提示）
+    st.caption("💡 例如: '这套系统怎么保证不说谎？' / '帮我讲讲代理梯度"
+               "方法的效果' / '第3篇论文的贡献是什么？'")
+    if q := st.chat_input("问系统使用或论文内容的任何问题…"):
+        st.session_state.assist_history.append(
+            {"role": "user", "content": q})
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("assistant"):
+            import llm_client
+            try:
+                ctx = _build_assistant_context()
+                sys_prompt = (
+                    "你是'科研文献整理Agent'系统的内置AI助手。用户可能是"
+                    "初次使用者或想了解论文内容的研究者。\n"
+                    "回答规则:\n"
+                    "1. 【系统使用类问题】(怎么操作、指标含义、某个标签页"
+                    "是什么): 根据下面的系统说明回答，简洁实用\n"
+                    "2. 【论文内容类问题】(方法、结果、结论): 只依据下面"
+                    "的'已核验声明池'和'最终综述报告'回答，引用标注"
+                    "[声明#N]；池里没有的不要编造，说明'当前结果中没有"
+                    "相关信息'\n"
+                    "3. 【两者混合】: 分别按对应规则处理\n"
+                    "4. 全程用中文，通俗但专业；回答末尾视情况提示用户"
+                    "去哪个标签页能看到更多（如'详见📎证据弹层'）\n\n"
+                    f"{ctx}"
+                )
+                history_msgs = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.assist_history[:-1][-6:]
+                ]
+                ans = st.write_stream(llm_client.chat_stream(
+                    [{"role": "system", "content": sys_prompt}]
+                    + history_msgs
+                    + [{"role": "user", "content": q}],
+                    temperature=0.3,
+                ))
+                st.session_state.assist_history.append(
+                    {"role": "assistant", "content": ans})
+            except Exception as e:
+                st.error(f"助手回答失败: {e}")
+
+    # 清空对话按钮
+    if st.button("🗑 清空对话"):
+        st.session_state.assist_history = []
+        st.rerun()
