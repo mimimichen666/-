@@ -315,9 +315,10 @@ if reviews:
                "原文不符的比例（越低越可信）；「可穿透证据」=能点击📎直达"
                "PDF原文高亮处的声明数。详见「📖 新手指南」标签页。")
 
-tabG, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tabG, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     ["📖 新手指南", "🔍 检索结果", "📄 信息卡片", "✅ 审查明细", "💬 可信问答",
-     "⚡ 学术争议", "📊 综述表格", "🕸 引用图谱", "📝 最终报告"])
+     "⚡ 学术争议", "📊 综述表格", "🕸 引用图谱", "📝 最终报告",
+     "📚 论文原文"])
 
 # ---- 标签页: 新手指南（核心知识解释，面向所有使用者）----
 with tabG:
@@ -343,7 +344,7 @@ with tabG:
 所以报告里的关键结论**可以点击📎按钮跳转到PDF原文高亮处验证**。
 """)
 
-    with st.expander("🗺️ 九个标签页分别看什么？（按推荐阅读顺序）", expanded=True):
+    with st.expander("🗺️ 十个标签页分别看什么？（按推荐阅读顺序）", expanded=True):
         st.markdown("""
 1. **🔍 检索结果** — 系统找到了哪些论文？为什么这篇排前面？
    每篇的徽章含义：`🔗引用链经典`=被多篇论文共同引用的奠基之作；
@@ -360,6 +361,8 @@ with tabG:
 7. **🕸 引用图谱** — 论文之间谁引用谁的关系网（可拖拽交互）。
 8. **📝 最终报告** — 综述正文。**看不懂？点"🍼 生成小白解读"按钮**，
    系统会把报告转写成带背景知识铺垫的通俗版。
+9. **📚 论文原文** — 想亲自读论文？选一篇就在网页里直接阅读PDF全文，
+   核对系统说的和论文写的是否一致。
 """)
 
     with st.expander("📚 术语速查表（看不懂某个词就来这里查）", expanded=False):
@@ -446,13 +449,17 @@ with tab0:
     else:
         st.info("暂无检索结果数据")
 
-# ---- 标签1: 信息卡片 ----
+# ---- 标签: 论文原文（本地PDF在线阅读）----
 with tab1:
     st.subheader("论文信息卡片（提取Agent产出）")
     st.caption("点击每条声明旁的 📎 按钮可穿透查看PDF原文高亮位置")
     for card in cards:
         with st.expander(f"📁 {card.title[:55]}... [{card.arxiv_id}] "
                          f"({card.year}) — {card.method_category}"):
+            # 原文入口: 该论文有本地PDF时提示跳转（跨标签页联动）
+            if os.path.exists(os.path.join(config.PAPER_DIR,
+                                           f"{card.arxiv_id}.pdf")):
+                st.caption("📚 想读整篇论文？到「论文原文」标签页选这篇即可在线阅读")
         # 展开显示每条声明及其原文引用
             for i, claim in enumerate(card.claims):
                 color = {"method": "🔵", "result": "🟢",
@@ -747,3 +754,64 @@ AI查语义曲解），每条关键信息理论上都可回溯到PDF原文。
         )
     else:
         st.warning("最终报告未生成")
+
+# ---- 标签8: 论文原文（本地PDF在线阅读）----
+with tab8:
+    st.subheader("论文原文阅读")
+    st.caption("流水线下载的PDF全文可在此直接阅读（浏览器内嵌渲染，"
+               "支持滚动翻页）。想核对系统声明的原文出处时用这里。")
+
+    # 扫描papers/目录，列出所有本地已有PDF（含未进入最终收录的）
+    import glob as _glob
+    pdf_files = sorted(_glob.glob(os.path.join(config.PAPER_DIR, "*.pdf")))
+    if not pdf_files:
+        st.info("papers/ 目录下没有PDF。请先完整运行一次流水线"
+                "（检索Agent会自动下载论文PDF到本地）。")
+    else:
+        # 用arxiv_id关联元数据（有标题/年份显示更友好，无元数据也能读）
+        meta_by_id = {p.arxiv_id: p for p in (papers or [])}
+        options = []
+        for path in pdf_files:
+            pid = os.path.splitext(os.path.basename(path))[0]
+            m = meta_by_id.get(pid)
+            label = (f"{m.title[:60]} ({m.year}) [{pid}]" if m
+                     else f"[{pid}]")
+            options.append(label)
+        choice = st.selectbox(
+            f"选择论文（本地共{len(pdf_files)}篇PDF）",
+            options,
+        )
+        # 从label反解arxiv_id（末尾方括号里）
+        chosen_id = choice[choice.rfind("[") + 1:-1]
+        pdf_path = os.path.join(config.PAPER_DIR, f"{chosen_id}.pdf")
+
+        size_mb = os.path.getsize(pdf_path) / 1024 / 1024
+        m = meta_by_id.get(chosen_id)
+        if m:
+            st.markdown(f"**{m.title}** · {m.year} · "
+                        f"被引{m.cited_by} · arXiv:{chosen_id} · "
+                        f"{size_mb:.1f}MB")
+        else:
+            st.caption(f"arXiv:{chosen_id} · {size_mb:.1f}MB")
+
+        # 内嵌渲染PDF: base64数据URI + 浏览器原生PDF阅读器
+        # （Streamlit 1.63无st.pdf组件；4MB级PDF的base64约5.5MB，
+        #  iframe可正常承载，实测Chrome/Edge渲染良好）
+        with open(pdf_path, "rb") as f:
+            import base64
+            b64 = base64.b64encode(f.read()).decode()
+        st.components.v1.html(
+            f'<iframe src="data:application/pdf;base64,{b64}" '
+            f'width="100%" height="860" '
+            f'style="border:1px solid #ddd;border-radius:8px">'
+            f'</iframe>',
+            height=880,
+        )
+        # 下载兜底（浏览器禁用内嵌PDF查看器时使用）
+        with open(pdf_path, "rb") as f:
+            st.download_button(
+                "⬇️ 下载该PDF",
+                data=f.read(),
+                file_name=f"{chosen_id}.pdf",
+                mime="application/pdf",
+            )
