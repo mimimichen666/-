@@ -828,11 +828,10 @@ with tab8:
             with pymupdf.open(path) as doc:
                 return doc.page_count
 
-        @st.cache_data(show_spinner="正在渲染页面...")
+        @st.cache_data(show_spinner=False)
         def _render_page(path: str, page_idx: int) -> bytes:
             """渲染单页为PNG图片（约150DPI，清晰度与速度的平衡）"""
             import pymupdf
-            import io
             with pymupdf.open(path) as doc:
                 page = doc[page_idx]
                 pix = page.get_pixmap(matrix=pymupdf.Matrix(1.8, 1.8))
@@ -844,43 +843,20 @@ with tab8:
             st.error(f"PDF解析失败: {e}")
             st.stop()
 
-        # 翻页控制: 页码输入 + 上一页/下一页按钮
-        nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 3])
-        if "pdf_page" not in st.session_state:
-            st.session_state.pdf_page = 1
-        # 切换论文时重置回第1页
-        if st.session_state.get("pdf_current_id") != chosen_id:
-            st.session_state.pdf_page = 1
-            st.session_state.pdf_current_id = chosen_id
-
-        with nav1:
-            if st.button("⬅️ 上一页", disabled=st.session_state.pdf_page <= 1):
-                st.session_state.pdf_page -= 1
-                st.rerun()
-        with nav2:
-            if st.button("下一页 ➡️",
-                         disabled=st.session_state.pdf_page >= n_pages):
-                st.session_state.pdf_page += 1
-                st.rerun()
-        with nav3:
-            new_page = st.number_input(
-                "页码", min_value=1, max_value=n_pages,
-                value=st.session_state.pdf_page, step=1,
+        # 连续滚动阅读: 全部页面纵向排列，滚轮从头读到尾，
+        # 无需逐页点击（首次渲染整篇需数秒，之后有缓存秒开）
+        st.caption(f"共 {n_pages} 页 · 滚动阅读 · 📎证据标注的页码与"
+                   f"下方页码标对应")
+        prog = st.progress(0.0, text="正在渲染整篇论文...")
+        for i in range(n_pages):
+            st.image(
+                _render_page(pdf_path, i),
+                caption=f"—— 第 {i + 1} 页 / 共 {n_pages} 页 ——",
+                use_container_width=True,
             )
-            if new_page != st.session_state.pdf_page:
-                st.session_state.pdf_page = new_page
-                st.rerun()
-        with nav4:
-            st.caption(f"共 {n_pages} 页 · 当前第 "
-                       f"{st.session_state.pdf_page}/{n_pages} 页 · "
-                       f"📎证据弹层里标注的页码可直接在此跳转查看")
-
-        st.image(
-            _render_page(pdf_path, st.session_state.pdf_page - 1),
-            caption=f"{chosen_id} · 第 {st.session_state.pdf_page} 页 / "
-                    f"共 {n_pages} 页",
-            use_container_width=True,
-        )
+            prog.progress((i + 1) / n_pages,
+                          text=f"已渲染 {i + 1}/{n_pages} 页")
+        prog.empty()
 
         # 下载兜底（需要原生PDF阅读器/离线细读时使用）
         with open(pdf_path, "rb") as f:
