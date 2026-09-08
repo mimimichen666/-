@@ -80,6 +80,13 @@ OPENALEX_UA = "literature-agent/0.1 (mailto:course-project@example.com)"
 # OpenAlex请求直接短路返回None（上层自动切换arXiv/S2兜底），
 # 避免对"要等十几小时才重置"的429做无意义的退避重试
 _OA_QUOTA_EXHAUSTED = False
+# 连续/累计429计数（不限原因的风暴熔断）:
+# 2026-09-08实测: 引用链挖掘跳过后，经典注入等调用点仍会对OpenAlex
+# 发请求，每个请求卡满4次退避重试(95秒)——即使不是"额度耗尽"型429
+# (如共享限流池打满)，风暴本身已让 enrichment 路失去性价比。
+# 累计429达到阈值即熔断，主检索(S2)不受影响。
+_OA_429_COUNT = 0
+_OA_429_TRIP_THRESHOLD = 6  # 累计6次429即熔断（约2-3个请求的重试消耗）
 
 
 def _check_oa_quota_error(resp: requests.Response) -> bool:
@@ -123,18 +130,25 @@ def _oa_request(params: dict, max_retries: int = 4) -> dict | None:
     返回:
         解析后的JSON dict，彻底失败返回None
     """
-    global _OA_QUOTA_EXHAUSTED
+    global _OA_QUOTA_EXHAUSTED, _OA_429_COUNT
     if _OA_QUOTA_EXHAUSTED:
         return None  # 熔断中：当天额度已耗尽，直接走兜底数据源
 
     backoffs = [5, 15, 30, 45]  # 429/5xx退避表(秒)，普通网络错误用短等待
     for attempt in range(max_retries):
+        if _OA_429_COUNT >= _OA_429_TRIP_THRESHOLD:
+            # 风暴熔断: 429已累计到阈值，重试纯属浪费时间
+            _OA_QUOTA_EXHAUSTED = True
+            print("[检索Agent] OpenAlex 429风暴(累计"
+                  f"{_OA_429_COUNT}次)，熔断并跳过本轮所有enrichment请求")
+            return None
         try:
             resp = requests.get(
                 OPENALEX_API_BASE, params=params,
                 headers={"User-Agent": OPENALEX_UA}, timeout=30,
             )
             resp.raise_for_status()
+            _OA_429_COUNT = 0  # 请求成功: 重置风暴计数
             return resp.json()
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
@@ -146,6 +160,8 @@ def _oa_request(params: dict, max_retries: int = 4) -> dict | None:
                       "熔断并切换arXiv/S2兜底（北京时间明早8点重置）")
                 return None
             if code == 429 or code >= 500:
+                if code == 429:
+                    _OA_429_COUNT += 1  # 风暴计数（达到阈值时下次循环前熔断）
                 wait = backoffs[min(attempt, len(backoffs) - 1)]
                 print(f"[检索Agent] OpenAlex限流/服务异常({code})，"
                       f"退避{wait}秒后重试(第{attempt + 1}次)")
@@ -329,7 +345,7 @@ def _oa_get_work(openalex_id: str,
 
     同样受全局熔断器保护（额度耗尽时直接返回None）
     """
-    global _OA_QUOTA_EXHAUSTED
+    global _OA_QUOTA_EXHAUSTED, _OA_429_COUNT
     if _OA_QUOTA_EXHAUSTED:
         return None
     url = f"https://api.openalex.org/works/{openalex_id}"
@@ -339,6 +355,7 @@ def _oa_get_work(openalex_id: str,
                                 headers={"User-Agent": OPENALEX_UA},
                                 timeout=30)
             resp.raise_for_status()
+            _OA_429_COUNT = 0
             return resp.json()
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
@@ -348,6 +365,8 @@ def _oa_get_work(openalex_id: str,
                 print("[检索Agent] OpenAlex当日额度已耗尽(单作品查询)，"
                       "熔断并跳过引用链挖掘")
                 return None
+            if code == 429:
+                _OA_429_COUNT += 1  # 纳入风暴计数（_oa_request同款逻辑）
             print(f"[检索Agent] 单作品查询错误({code})，放弃")
             return None
         except Exception as e:
@@ -615,6 +634,11 @@ def _inject_classics(classic_titles: list[str],
         成功注入的经典PaperMeta列表（已加入seen）
     """
     if not classic_titles:
+        return []
+    if _OA_QUOTA_EXHAUSTED:
+        # 熔断中(额度耗尽或429风暴): OpenAlex反查必失败，整体跳过
+        # （2026-09-08实测: 不检查就会每个标题白等4次退避重试）
+        print("[检索Agent] OpenAlex熔断中，经典注入跳过")
         return []
     from difflib import SequenceMatcher
 
