@@ -167,6 +167,19 @@ hr { border-color: #EEF2FF; }
     background: #C7D2FE; border-radius: 999px;
 }
 ::-webkit-scrollbar-thumb:hover { background: #A5B4FC; }
+
+/* ===== 亮色主题防御（配合.streamlit/config.toml的theme锁定） =====
+   背景: 用户浏览器端曾持久化深色主题，仅CSS改浅背景会白字白底。
+   下方规则确保正文文字在任何残留主题下都是深色可读。
+   注意: Hero横幅用内联样式白字，不受此影响（渐变深底正确显示） */
+[data-testid="stMarkdownContainer"],
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] td,
+[data-testid="stExpander"], .stTabs, .stRadio, .stSelectbox,
+.stTextInput, .stSlider, .stMetric {
+    color: #0F172A !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
