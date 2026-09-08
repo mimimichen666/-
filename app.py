@@ -769,8 +769,8 @@ AI查语义曲解），每条关键信息理论上都可回溯到PDF原文。
 # ---- 标签8: 论文原文（本地PDF在线阅读）----
 with tab8:
     st.subheader("论文原文阅读")
-    st.caption("流水线下载的PDF全文可在此直接阅读（浏览器内嵌渲染，"
-               "支持滚动翻页）。想核对系统声明的原文出处时用这里。")
+    st.caption("流水线下载的PDF全文可在此逐页阅读。想核对系统声明的"
+               "原文出处时用这里（📄信息卡片里的📎证据会给出页码）。")
 
     # 扫描papers/目录，列出所有本地已有PDF（含未进入最终收录的）
     import glob as _glob
@@ -796,29 +796,78 @@ with tab8:
         chosen_id = choice[choice.rfind("[") + 1:-1]
         pdf_path = os.path.join(config.PAPER_DIR, f"{chosen_id}.pdf")
 
-        size_mb = os.path.getsize(pdf_path) / 1024 / 1024
         m = meta_by_id.get(chosen_id)
         if m:
             st.markdown(f"**{m.title}** · {m.year} · "
-                        f"被引{m.cited_by} · arXiv:{chosen_id} · "
-                        f"{size_mb:.1f}MB")
+                        f"被引{m.cited_by} · arXiv:{chosen_id}")
         else:
-            st.caption(f"arXiv:{chosen_id} · {size_mb:.1f}MB")
+            st.caption(f"arXiv:{chosen_id}")
 
-        # 内嵌渲染PDF: base64数据URI + 浏览器原生PDF阅读器
-        # （Streamlit 1.63无st.pdf组件；4MB级PDF的base64约5.5MB，
-        #  iframe可正常承载，实测Chrome/Edge渲染良好）
-        with open(pdf_path, "rb") as f:
-            import base64
-            b64 = base64.b64encode(f.read()).decode()
-        st.components.v1.html(
-            f'<iframe src="data:application/pdf;base64,{b64}" '
-            f'width="100%" height="860" '
-            f'style="border:1px solid #ddd;border-radius:8px">'
-            f'</iframe>',
-            height=880,
+        # ---- 按页渲染为图片显示（可靠方案）----
+        # 背景: base64数据URI内嵌PDF会被Streamlit组件的沙箱iframe
+        # 拦截（浏览器插件策略），实测无法渲染。改用PyMuPDF逐页
+        # 渲染PNG——任何浏览器都支持，还能精确对应📎证据的页码。
+        @st.cache_data(show_spinner="正在解析PDF...")
+        def _pdf_page_count(path: str) -> int:
+            import pymupdf
+            with pymupdf.open(path) as doc:
+                return doc.page_count
+
+        @st.cache_data(show_spinner="正在渲染页面...")
+        def _render_page(path: str, page_idx: int) -> bytes:
+            """渲染单页为PNG图片（约150DPI，清晰度与速度的平衡）"""
+            import pymupdf
+            import io
+            with pymupdf.open(path) as doc:
+                page = doc[page_idx]
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(1.8, 1.8))
+                return pix.tobytes("png")
+
+        try:
+            n_pages = _pdf_page_count(pdf_path)
+        except Exception as e:
+            st.error(f"PDF解析失败: {e}")
+            st.stop()
+
+        # 翻页控制: 页码输入 + 上一页/下一页按钮
+        nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 3])
+        if "pdf_page" not in st.session_state:
+            st.session_state.pdf_page = 1
+        # 切换论文时重置回第1页
+        if st.session_state.get("pdf_current_id") != chosen_id:
+            st.session_state.pdf_page = 1
+            st.session_state.pdf_current_id = chosen_id
+
+        with nav1:
+            if st.button("⬅️ 上一页", disabled=st.session_state.pdf_page <= 1):
+                st.session_state.pdf_page -= 1
+                st.rerun()
+        with nav2:
+            if st.button("下一页 ➡️",
+                         disabled=st.session_state.pdf_page >= n_pages):
+                st.session_state.pdf_page += 1
+                st.rerun()
+        with nav3:
+            new_page = st.number_input(
+                "页码", min_value=1, max_value=n_pages,
+                value=st.session_state.pdf_page, step=1,
+            )
+            if new_page != st.session_state.pdf_page:
+                st.session_state.pdf_page = new_page
+                st.rerun()
+        with nav4:
+            st.caption(f"共 {n_pages} 页 · 当前第 "
+                       f"{st.session_state.pdf_page}/{n_pages} 页 · "
+                       f"📎证据弹层里标注的页码可直接在此跳转查看")
+
+        st.image(
+            _render_page(pdf_path, st.session_state.pdf_page - 1),
+            caption=f"{chosen_id} · 第 {st.session_state.pdf_page} 页 / "
+                    f"共 {n_pages} 页",
+            use_container_width=True,
         )
-        # 下载兜底（浏览器禁用内嵌PDF查看器时使用）
+
+        # 下载兜底（需要原生PDF阅读器/离线细读时使用）
         with open(pdf_path, "rb") as f:
             st.download_button(
                 "⬇️ 下载该PDF",
