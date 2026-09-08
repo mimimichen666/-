@@ -718,30 +718,39 @@ AI查语义曲解），每条关键信息理论上都可回溯到PDF原文。
         """)
     if report_md:
         # 小白解读生成（把综述转写成带背景知识的通俗版）
+        # 注意: 生成耗时2-4分钟属正常（输出几千字），流式显示让你
+        # 看到逐字进度而不是干等转圈；切换标签页会中断，请停留本页
         if st.button("🍼 生成小白解读", help="把报告转写为通俗版：解释所有术语、"
-                     "补充背景知识、用生活化类比（约1分钟，不改动任何事实）"):
-            with st.spinner("AI科普编辑正在转写报告（约1分钟）..."):
+                     "补充背景知识、用生活化类比（约2-4分钟，生成过程"
+                     "逐字显示，请勿切换标签页）"):
+            with st.expander("🍼 小白版报告（通俗解读）", expanded=True):
                 import llm_client
-                plain = llm_client.chat(
+                st.caption("⏳ 正在生成（2-4分钟）... 下方文字会逐步出现，"
+                           "请停留在本页")
+                plain = st.write_stream(llm_client.chat_stream(
                     [
                         {"role": "system", "content":
                          "你是一位优秀的科研科普编辑。任务：把学术文献综述"
                          "转写成零基础读者（大学生初学者）也能看懂的通俗版。"
                          "要求：\n"
-                         "1. 术语首次出现时用一句话解释（可用括号或脚注形式）\n"
-                         "2. 每个方法分类开头补充2-3句背景知识（这个方法在解决"
-                         "什么问题、核心思路用生活化类比）\n"
+                         "1. 术语首次出现时用一句话解释（可用括号形式）\n"
+                         "2. 每个方法分类开头补充1-2句背景知识（这个方法在"
+                         "解决什么问题、核心思路用生活化类比）\n"
                          "3. 保留全部数据、结论和论文引用信息，**严禁添加"
                          "报告之外的推测或事实**\n"
-                         "4. 用markdown输出，结构对应原报告但标题可更口语化\n"
-                         "5. 结尾加一段'读完后你可以进一步了解什么'的指引"},
+                         "4. 全文控制在1500字以内，只讲最重要的内容\n"
+                         "5. 用markdown输出，标题口语化，结尾加一段"
+                         "'读完后可以进一步了解什么'"},
                         {"role": "user",
                          "content": f"请转写以下文献综述：\n\n{report_md}"},
                     ],
                     temperature=0.3,
-                )
+                ))
                 st.session_state.plain_report = plain
-        if st.session_state.get("plain_report"):
+                st.session_state._just_generated = True
+                st.success("✅ 小白解读已生成，可再次点击按钮重新生成")
+        if (st.session_state.get("plain_report")
+                and not st.session_state.pop("_just_generated", False)):
             with st.expander("🍼 小白版报告（通俗解读）", expanded=True):
                 st.markdown(st.session_state.plain_report)
         st.markdown(report_md)

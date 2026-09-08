@@ -69,6 +69,40 @@ def chat(messages, temperature=0.2, model=None, max_retries=3):
     raise RuntimeError(f"LLM调用连续失败{max_retries}次，请检查网络和API密钥")
 
 
+def chat_stream(messages, temperature=0.2, model=None, max_retries=2):
+    """
+    流式对话函数（长文本生成场景专用）
+
+    与chat()的区别: 边生成边返回文本片段（yield），前端可逐字显示进度。
+    适用场景: 小白解读、综述正文等输出几千字的任务——一次性生成要等
+    2-4分钟且界面无任何反馈，流式输出让用户看到"正在写"。
+
+    参数同chat()。
+    返回:
+        生成器，逐块yield文本片段(str)
+    """
+    model = model or config.MODEL_NAME
+
+    for attempt in range(max_retries):
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                stream=True,
+            )
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+            return  # 正常结束
+        except Exception as e:
+            wait = 2 ** (attempt + 1)
+            print(f"[llm_client] 流式调用失败(第{attempt + 1}次): {e}，{wait}秒后重试...")
+            time.sleep(wait)
+
+    raise RuntimeError(f"LLM流式调用连续失败{max_retries}次，请检查网络和API密钥")
+
+
 def chat_json(messages, schema_class, temperature=0.1, model=None):
     """
     要求模型输出 JSON 并解析为 Pydantic 对象
