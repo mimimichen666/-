@@ -794,22 +794,61 @@ with tab8:
         st.info("papers/ 目录下没有PDF。请先完整运行一次流水线"
                 "（检索Agent会自动下载论文PDF到本地）。")
     else:
-        # 用arxiv_id关联元数据（有标题/年份显示更友好，无元数据也能读）
+        # 用arxiv_id关联元数据
         meta_by_id = {p.arxiv_id: p for p in (papers or [])}
+        all_ids = [os.path.splitext(os.path.basename(p))[0]
+                   for p in pdf_files]
+        id_path = {pid: path for pid, path in zip(all_ids, pdf_files)}
+
+        # 本次检索到的论文（元数据里有且PDF已下载）置顶，其余本地PDF靠后
+        retrieved = [p for p in (papers or []) if p.arxiv_id in id_path]
+        other_ids = [pid for pid in all_ids
+                     if pid not in {p.arxiv_id for p in retrieved}]
+
+        # 排序方式与「检索结果」标签页一致（四路信号同口径）
+        sort_mode8 = st.radio(
+            "本次检索论文排序",
+            ["🎯 综合推荐", "🤖 相关优先", "🔥 经典优先", "🆕 最新优先"],
+            horizontal=True,
+            key="sort_pdf",
+            help="综合推荐=四路信号加权(默认); 相关优先=LLM切题度优先; "
+                 "经典优先=被引数优先; 最新优先=发表年份优先。"
+                 "排序只作用于本次检索到的论文，其他本地PDF附后",
+        )
+        if sort_mode8 == "🎯 综合推荐":
+            retrieved.sort(key=lambda p: p.final_score or 0, reverse=True)
+        elif sort_mode8 == "🤖 相关优先":
+            retrieved.sort(key=lambda p: p.relevance_score or 0, reverse=True)
+        elif sort_mode8 == "🔥 经典优先":
+            retrieved.sort(key=lambda p: p.cited_by, reverse=True)
+        else:
+            retrieved.sort(key=lambda p: p.year, reverse=True)
+
+        # 构造下拉选项: 置顶段带排名和徽章，其他段标"未入选本次检索"
         options = []
-        for path in pdf_files:
-            pid = os.path.splitext(os.path.basename(path))[0]
-            m = meta_by_id.get(pid)
-            label = (f"{m.title[:60]} ({m.year}) [{pid}]" if m
-                     else f"[{pid}]")
-            options.append(label)
+        for rank, p in enumerate(retrieved, 1):
+            badges = []
+            if p.chain_hits >= 3:
+                badges.append("🔗引用链经典")
+            if p.cited_by >= 300:
+                badges.append(f"🔥{p.cited_by}被引")
+            if (p.relevance_score or 0) >= 4.5:
+                badges.append("🤖高度切题")
+            badge_str = (" " + " ".join(badges)) if badges else ""
+            options.append(
+                f"{rank}. {p.title[:55]} ({p.year}){badge_str} [{p.arxiv_id}]"
+            )
+        for pid in other_ids:
+            options.append(f"📖 其他本地PDF [{pid}]")
+
         choice = st.selectbox(
-            f"选择论文（本地共{len(pdf_files)}篇PDF）",
+            f"选择论文（本次检索{len(retrieved)}篇 · "
+            f"其他本地{len(other_ids)}篇）",
             options,
         )
         # 从label反解arxiv_id（末尾方括号里）
         chosen_id = choice[choice.rfind("[") + 1:-1]
-        pdf_path = os.path.join(config.PAPER_DIR, f"{chosen_id}.pdf")
+        pdf_path = id_path[chosen_id]
 
         m = meta_by_id.get(chosen_id)
         if m:
