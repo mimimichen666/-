@@ -38,6 +38,138 @@ st.set_page_config(
     layout="wide",
 )
 
+# ---------------------------------------------------------------
+# 全局视觉设计系统（对齐主流SaaS产品观感）
+# 设计语言: 靛紫渐变主色 + 卡片化布局 + 柔和阴影 + 圆角
+# 只用系统字体栈（不依赖外网字体，国内网络环境稳定）
+# ---------------------------------------------------------------
+st.markdown("""
+<style>
+/* ===== 全局基础 ===== */
+:root {
+    --primary: #4F46E5;       /* 主色: 靛蓝 */
+    --primary-dark: #4338CA;
+    --accent: #7C3AED;        /* 强调色: 紫罗兰 */
+    --bg-soft: #F8FAFC;       /* 页面浅底 */
+    --card-border: #E2E8F0;
+    --text-main: #0F172A;
+}
+html, body, [class*="css"], .stApp {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 "PingFang SC", "Microsoft YaHei", "Noto Sans SC",
+                 sans-serif;
+    color: var(--text-main);
+}
+.stApp { background: var(--bg-soft); }
+/* 主区域内容最大宽度收拢（过宽降低阅读舒适度） */
+.block-container { padding-top: 1.6rem; max-width: 1400px; }
+
+/* ===== 侧边栏: 品牌化渐变头部 ===== */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #FFFFFF 0%, #F5F3FF 100%);
+    border-right: 1px solid var(--card-border);
+}
+[data-testid="stSidebar"] h1 {
+    background: linear-gradient(90deg, var(--primary), var(--accent));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: 800;
+    letter-spacing: .5px;
+}
+/* 侧边栏输入控件统一圆角 */
+[data-testid="stSidebar"] .stTextInput input,
+[data-testid="stSidebar"] .stSlider > div {
+    border-radius: 10px;
+}
+
+/* ===== 按钮: 渐变主按钮 + 圆角次按钮 ===== */
+.stButton > button {
+    border-radius: 10px;
+    font-weight: 600;
+    border: 1px solid var(--card-border);
+    transition: all .18s ease;
+}
+.stButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px rgba(79, 70, 229, .18);
+}
+button[kind="primary"], [data-testid="baseButton-primary"] {
+    background: linear-gradient(90deg, var(--primary), var(--accent)) !important;
+    color: #FFF !important;
+    border: none !important;
+    box-shadow: 0 2px 10px rgba(79, 70, 229, .35);
+}
+
+/* ===== 顶部统计卡片(metric): 白卡+悬浮上浮 ===== */
+[data-testid="stMetric"] {
+    background: #FFFFFF;
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 14px 18px;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, .06);
+    transition: all .18s ease;
+}
+[data-testid="stMetric"]:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 18px rgba(79, 70, 229, .12);
+    border-color: #C7D2FE;
+}
+[data-testid="stMetricValue"] {
+    color: var(--primary);
+    font-weight: 800;
+}
+[data-testid="stMetricLabel"] { font-weight: 600; color: #475569; }
+
+/* ===== 标签页: 药丸风格 ===== */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 6px;
+    border-bottom: 2px solid #EEF2FF;
+}
+.stTabs [data-baseweb="tab"] {
+    border-radius: 999px;
+    padding: 6px 16px;
+    font-weight: 600;
+    color: #64748B;
+    background: transparent;
+}
+.stTabs [aria-selected="true"] {
+    background: linear-gradient(90deg, #EEF2FF, #F5F3FF);
+    color: var(--primary) !important;
+    border-radius: 999px;
+}
+.stTabs [data-baseweb="tab-highlight"] { display: none; }
+
+/* ===== 折叠面板(expander): 卡片化 ===== */
+[data-testid="stExpander"] details {
+    border: 1px solid var(--card-border) !important;
+    border-radius: 12px !important;
+    background: #FFFFFF;
+    overflow: hidden;
+    transition: box-shadow .18s ease;
+}
+[data-testid="stExpander"] details:hover {
+    box-shadow: 0 3px 12px rgba(15, 23, 42, .07);
+}
+[data-testid="stExpander"] summary { font-weight: 600; }
+
+/* ===== 表单控件标签加粗 ===== */
+[data-baseweb="radio"] span, .stSelectbox label,
+.stTextInput label, .stSlider label { font-weight: 600; }
+
+/* ===== Markdown链接与分隔线 ===== */
+a { color: var(--primary); }
+hr { border-color: #EEF2FF; }
+
+/* ===== 滚动条 ===== */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb {
+    background: #C7D2FE; border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover { background: #A5B4FC; }
+</style>
+""", unsafe_allow_html=True)
+
 # 会话状态: 存放流水线的中间产出（跨标签页共享，避免重复计算）
 if "pipeline_done" not in st.session_state:
     st.session_state.pipeline_done = False
@@ -297,6 +429,31 @@ def evidence_popover(label: str, arxiv_id: str, claim_index: int,
             for q in quotes:
                 st.markdown(f"> `{q.section}` {q.text[:150]}")
 
+
+# ---- 顶部Hero横幅（品牌化门面） ----
+st.markdown("""
+<div style="
+    background: linear-gradient(120deg, #4F46E5 0%, #7C3AED 55%, #A855F7 100%);
+    border-radius: 18px; padding: 26px 32px; margin-bottom: 6px;
+    color: #FFFFFF; box-shadow: 0 8px 24px rgba(79,70,229,.25);">
+  <div style="font-size: 1.7rem; font-weight: 800; letter-spacing: .5px;">
+    📚 科研文献整理 Agent
+  </div>
+  <div style="margin-top: 6px; opacity: .92; font-size: 1.0rem;">
+    检索 → 提取 → 审查 → 综合 —— 每句话都有原文出处的可信文献综述
+  </div>
+  <div style="margin-top: 12px;">
+    <span style="background:rgba(255,255,255,.18); border-radius:999px;
+      padding:4px 14px; margin-right:8px; font-size:.85rem;">🛡 两级防幻觉核验</span>
+    <span style="background:rgba(255,255,255,.18); border-radius:999px;
+      padding:4px 14px; margin-right:8px; font-size:.85rem;">📎 证据链穿透到PDF原文</span>
+    <span style="background:rgba(255,255,255,.18); border-radius:999px;
+      padding:4px 14px; margin-right:8px; font-size:.85rem;">⚡ 学术争议发现</span>
+    <span style="background:rgba(255,255,255,.18); border-radius:999px;
+      padding:4px 14px; font-size:.85rem;">🕸 引用图谱</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 # ---- 顶部统计卡片 ----
 if reviews:
