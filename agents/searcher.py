@@ -45,6 +45,7 @@ import requests
 
 import llm_client
 import config
+import cache
 from models import SearchPlan, PaperMeta
 
 # 相关性评分的输出结构（局部使用，放这里就够了，不污染models.py）
@@ -87,6 +88,18 @@ _OA_QUOTA_EXHAUSTED = False
 # 累计429达到阈值即熔断，主检索(S2)不受影响。
 _OA_429_COUNT = 0
 _OA_429_TRIP_THRESHOLD = 6  # 累计6次429即熔断（约2-3个请求的重试消耗）
+
+# ---------------------------------------------------------------
+# S2熔断器全局状态（2026-09-09实测教训）:
+# S2共享基础设施过载时，即使认证模式+合规节奏也会持续429，
+# 旧逻辑每个关键词都卡满3次退避(10/20/30秒)才放弃，4个关键词
+# 最坏白等4分钟。仿照OpenAlex加风暴熔断: 连续429达到阈值后
+# 短路一段时间（冷却后自动恢复，S2抖动通常几分钟内好转，
+# 不能像OpenAlex额度那样熔断一整天）。
+_S2_429_COUNT = 0          # 连续429计数（成功一次即清零）
+_S2_BREAKER_UNTIL = 0.0    # 熔断到期时间戳（0=未熔断；当前时间<它则短路）
+_S2_BREAKER_TRIP = 3       # 连续3次429即熔断
+_S2_BREAKER_COOLDOWN = 300 # 熔断冷却5分钟（到期自动放行试探）
 
 
 def _check_oa_quota_error(resp: requests.Response) -> bool:
@@ -131,6 +144,20 @@ def _oa_request(params: dict, max_retries: int = 4) -> dict | None:
         解析后的JSON dict，彻底失败返回None
     """
     global _OA_QUOTA_EXHAUSTED, _OA_429_COUNT
+
+    # ---- 缓存层（成员A·任务1）----
+    # 先查缓存再谈额度/熔断：命中则完全绕过网络和OpenAlex计数器，
+    # 这正是缓存的核心价值——额度耗尽/熔断当天，已缓存过的请求
+    # 照样秒回，流水线第二次运行不再烧任何请求
+    _ck = cache.make_key("openalex", params)
+    _hit = cache.get(_ck)
+    if _hit is not None:
+        # 命中提示: 缓存本是静默生效的，不打印的话使用者无法感知
+        # 它在工作（2026-09-09实测反馈"观感不明显"的根源）
+        print(f"[检索Agent] 缓存命中(openalex): "
+              f"{str(params.get('filter') or params)[:50]}")
+        return _hit
+
     if _OA_QUOTA_EXHAUSTED:
         return None  # 熔断中：当天额度已耗尽，直接走兜底数据源
 
@@ -143,35 +170,53 @@ def _oa_request(params: dict, max_retries: int = 4) -> dict | None:
                   f"{_OA_429_COUNT}次)，熔断并跳过本轮所有enrichment请求")
             return None
         try:
+            _t0 = time.perf_counter()
             resp = requests.get(
                 OPENALEX_API_BASE, params=params,
                 headers={"User-Agent": OPENALEX_UA}, timeout=30,
             )
             resp.raise_for_status()
             _OA_429_COUNT = 0  # 请求成功: 重置风暴计数
-            return resp.json()
+            payload = resp.json()
+            # 只缓存200成功响应（cache.put的契约）——429/5xx走异常
+            # 分支，永远到不了这里，熔断检测不会被污染
+            cache.put(_ck, payload)
+            cache.log_request("openalex", _ck,
+                              (time.perf_counter() - _t0) * 1000, "ok")
+            return payload
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
             if code == 429 and e.response is not None and \
                     _check_oa_quota_error(e.response):
                 # 额度耗尽型429: 熔断，不再重试（重试要等到UTC午夜）
                 _OA_QUOTA_EXHAUSTED = True
+                cache.log_request("openalex", _ck,
+                                  (time.perf_counter() - _t0) * 1000,
+                                  "429_quota")
                 print("[检索Agent] OpenAlex当日额度已耗尽($0.1/天)，"
                       "熔断并切换arXiv/S2兜底（北京时间明早8点重置）")
                 return None
             if code == 429 or code >= 500:
                 if code == 429:
                     _OA_429_COUNT += 1  # 风暴计数（达到阈值时下次循环前熔断）
+                cache.log_request("openalex", _ck,
+                                  (time.perf_counter() - _t0) * 1000,
+                                  str(code))
                 wait = backoffs[min(attempt, len(backoffs) - 1)]
                 print(f"[检索Agent] OpenAlex限流/服务异常({code})，"
                       f"退避{wait}秒后重试(第{attempt + 1}次)")
                 time.sleep(wait)
             else:
                 # 400/403/404等参数类错误，重试无意义
+                cache.log_request("openalex", _ck,
+                                  (time.perf_counter() - _t0) * 1000,
+                                  str(code))
                 print(f"[检索Agent] OpenAlex请求错误({code})，放弃: "
                       f"{str(e)[:80]}")
                 return None
         except Exception as e:
+            cache.log_request("openalex", _ck,
+                              (time.perf_counter() - _t0) * 1000, "error")
             print(f"[检索Agent] OpenAlex请求异常(第{attempt + 1}次): {e}")
             time.sleep(2)
     return None
@@ -344,21 +389,43 @@ def _oa_get_work(openalex_id: str,
     这个查单个作品端点(/works/W123)，用于拿某篇论文的参考文献列表
 
     同样受全局熔断器保护（额度耗尽时直接返回None）
+
+    缓存层（成员A·任务1）: 引用链挖掘对同一批经典论文的
+    referenced_works 反复查（每轮挖掘都要拿种子的参考文献列表），
+    这是OpenAlex请求量的大头。命中缓存时完全不消耗每日额度，
+    熔断当天引用链挖掘照样能从缓存跑通。
     """
     global _OA_QUOTA_EXHAUSTED, _OA_429_COUNT
+
+    # ---- 缓存层：先查缓存，命中则绕过网络和熔断检查 ----
+    _ck = cache.make_key("openalex_work",
+                         {"id": openalex_id, "select": select})
+    _hit = cache.get(_ck)
+    if _hit is not None:
+        print(f"[检索Agent] 缓存命中(openalex_work): {openalex_id}")
+        return _hit
+
     if _OA_QUOTA_EXHAUSTED:
         return None
     url = f"https://api.openalex.org/works/{openalex_id}"
     for attempt in range(3):
         try:
+            _t0 = time.perf_counter()
             resp = requests.get(url, params={"select": select},
                                 headers={"User-Agent": OPENALEX_UA},
                                 timeout=30)
             resp.raise_for_status()
             _OA_429_COUNT = 0
-            return resp.json()
+            payload = resp.json()
+            # 只缓存200成功响应（429/5xx走异常分支到不了这里）
+            cache.put(_ck, payload)
+            cache.log_request("openalex_work", _ck,
+                              (time.perf_counter() - _t0) * 1000, "ok")
+            return payload
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
+            cache.log_request("openalex_work", _ck,
+                              (time.perf_counter() - _t0) * 1000, str(code))
             if code == 429 and e.response is not None and \
                     _check_oa_quota_error(e.response):
                 _OA_QUOTA_EXHAUSTED = True
@@ -370,6 +437,8 @@ def _oa_get_work(openalex_id: str,
             print(f"[检索Agent] 单作品查询错误({code})，放弃")
             return None
         except Exception as e:
+            cache.log_request("openalex_work", _ck,
+                              (time.perf_counter() - _t0) * 1000, "error")
             print(f"[检索Agent] 单作品查询异常(第{attempt + 1}次): {e}")
             time.sleep(1.5)
     return None
@@ -722,6 +791,33 @@ def _find_duplicate_by_openalex(w_id: str,
 # ---------------------------------------------------------------
 # 第1段-B：arXiv官方API检索（兜底1）
 # ---------------------------------------------------------------
+def _arxiv_request(params: dict) -> str | None:
+    """
+    带缓存的arXiv API查询（成员A·任务1），返回原始XML文本
+
+    arXiv返回Atom XML而非JSON，故用{"_xml": 文本}包装后入缓存，
+    与OpenAlex/S2的dict缓存共用同一张表和同一套TTL/日志机制。
+    arXiv无密钥限流，但有间歇性封锁（2026-09实测），缓存后
+    同关键词的兜底检索不再重复碰运气。
+    """
+    _ck = cache.make_key("arxiv", params)
+    _hit = cache.get(_ck)
+    if _hit is not None:
+        print(f"[检索Agent] 缓存命中(arxiv): "
+              f"{params.get('search_query', '')[:50]}")
+        return _hit.get("_xml", "")
+    try:
+        _t0 = time.perf_counter()
+        resp = requests.get(ARXIV_API_BASE, params=params, timeout=30)
+        resp.raise_for_status()
+    except Exception:
+        return None  # 失败不缓存（下次还会真实重试）
+    cache.put(_ck, {"_xml": resp.text})
+    cache.log_request("arxiv", _ck,
+                      (time.perf_counter() - _t0) * 1000, "ok")
+    return resp.text
+
+
 def _arxiv_search(kw: str, limit: int) -> list[PaperMeta]:
     """
     调用arXiv官方API检索单个关键词
@@ -738,16 +834,14 @@ def _arxiv_search(kw: str, limit: int) -> list[PaperMeta]:
         "max_results": limit,
         "sortBy": "relevance",
     }
-    try:
-        resp = requests.get(ARXIV_API_BASE, params=params, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[检索Agent] arXiv API不可达({e})，将切换兜底源")
+    xml_text = _arxiv_request(params)
+    if xml_text is None:
+        print("[检索Agent] arXiv API不可达，将切换兜底源")
         return []
 
     # 解析Atom XML（命名空间处理是标准写法）
     ns = {"a": "http://www.w3.org/2005/Atom"}
-    root = ET.fromstring(resp.text)
+    root = ET.fromstring(xml_text)
     papers = []
     for entry in root.findall("a:entry", ns):
         # arXiv的entry.id形如 http://arxiv.org/abs/2401.12345v2
@@ -797,18 +891,57 @@ def _s2_request(params: dict, max_retries: int = 3) -> dict | None:
     返回:
         解析后的JSON dict，彻底失败返回None
     """
+    global _S2_429_COUNT, _S2_BREAKER_UNTIL
     headers = {"x-api-key": config.S2_API_KEY} if config.S2_API_KEY else {}
+
+    # ---- 缓存层（成员A·任务1）----
+    # 缓存键只含查询参数不含API密钥（密钥在headers里，不进params，
+    # 换密钥后缓存依然有效——S2返回的元数据与哪个密钥请求无关）。
+    # 命中后跳过下方1 req/s限速等待：没有网络请求就无所谓限速
+    _ck = cache.make_key("s2", params)
+    _hit = cache.get(_ck)
+    if _hit is not None:
+        # 命中提示: 同时说明跳过了1 req/s限速（缓存读无需排队）
+        print(f"[检索Agent] 缓存命中(s2): "
+              f"{str(params.get('query', ''))[:50]} (跳过限速等待)")
+        return _hit
+
+    # ---- S2熔断检查（连续429风暴时短路，冷却后自动恢复）----
+    # 熔断期间不发请求不等待，上层立即切换OpenAlex/arXiv兜底
+    if time.time() < _S2_BREAKER_UNTIL:
+        remain = int(_S2_BREAKER_UNTIL - time.time())
+        print(f"[检索Agent] S2熔断中(连续{_S2_429_COUNT}次429，"
+              f"冷却剩{remain}秒)，本请求跳过走兜底数据源")
+        return None
 
     for attempt in range(max_retries):
         try:
+            _t0 = time.perf_counter()
             resp = requests.get(S2_API_BASE, params=params,
                                 headers=headers, timeout=30)
             if resp.status_code == 429:
                 # 优先尊重服务端给的Retry-After（秒），没有则用退避序列
+                cache.log_request("s2", _ck,
+                                  (time.perf_counter() - _t0) * 1000,
+                                  "429")
+                # ---- 风暴熔断计数（2026-09-09）----
+                # 连续429达到阈值说明是S2服务端过载而非本地节奏问题，
+                # 再等再试都是白费——熔断5分钟，本轮走兜底
+                _S2_429_COUNT += 1
+                if _S2_429_COUNT >= _S2_BREAKER_TRIP:
+                    _S2_BREAKER_UNTIL = (time.time()
+                                         + _S2_BREAKER_COOLDOWN)
+                    print(f"[检索Agent] S2连续{_S2_429_COUNT}次429"
+                          f"(服务端过载)，熔断{_S2_BREAKER_COOLDOWN // 60}"
+                          f"分钟并切换OpenAlex/arXiv兜底（冷却后自动恢复）")
+                    return None
+                # ---- 退避序列: 3/8/15秒（旧值10/20/30过保守）----
+                # 实测S2的429多是共享池秒级抖动，首次3秒通常已够；
+                # Retry-After头有值时始终优先尊重服务端指示
                 retry_after = resp.headers.get("Retry-After")
                 if config.S2_API_KEY:
                     wait = (int(retry_after) + 1 if retry_after
-                            else 10 * (attempt + 1))
+                            else (3, 8, 15)[min(attempt, 2)])
                 else:
                     wait = 30
                 mode = "认证" if config.S2_API_KEY else "匿名"
@@ -817,12 +950,22 @@ def _s2_request(params: dict, max_retries: int = 3) -> dict | None:
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
+            payload = resp.json()
+            # 请求成功: 连续429计数清零（风暴解除）
+            _S2_429_COUNT = 0
+            # 只缓存200成功响应（cache.put的契约）；429在上面continue
+            # 分支已被拦截，到这里的必然是成功响应
+            cache.put(_ck, payload)
+            cache.log_request("s2", _ck,
+                              (time.perf_counter() - _t0) * 1000, "ok")
             # 官方限流为所有端点合计1次/秒，且共享负载高时1秒间隔
             # 也会429（2026-09-07实测），成功后强制2秒间隔宁慢勿堵
             if config.S2_API_KEY:
                 time.sleep(2)
-            return resp.json()
+            return payload
         except Exception as e:
+            cache.log_request("s2", _ck,
+                              (time.perf_counter() - _t0) * 1000, "error")
             print(f"[检索Agent] S2请求异常(第{attempt + 1}次): {e}")
             time.sleep(5)
     return None
@@ -1017,25 +1160,27 @@ def search(plan: SearchPlan, results_per_query: int = 10) -> list[PaperMeta]:
         # 额度易烧穿) -> arXiv(间歇性阻断)
         if source is None or source == "s2":
             cited_res = _s2_search(kw, results_per_query, year_from)
-            if source is None:
-                if cited_res:
+            if cited_res:
+                if source is None:
                     source = "s2"
                     print(f"[检索Agent] 数据源选定: Semantic Scholar"
                           f"(认证模式"
                           f"{f', 年份下限{year_from}' if year_from else ''})")
+            else:
+                # S2失败（首轮即不可用，或中途429熔断）: 降级OpenAlex双路。
+                # 注意source=="s2"时也要走这里——否则熔断后剩余关键词
+                # 会拿到空结果静默丢失（2026-09-09熔断器引入时修复）
+                cited_res = _openalex_search(kw, results_per_query,
+                                             year_from, sort_mode="cited")
+                if cited_res:
+                    source = "openalex"
+                    print("[检索Agent] S2不可用, 数据源切换: "
+                          "OpenAlex双路检索")
                 else:
-                    # 降级: OpenAlex双路
-                    cited_res = _openalex_search(kw, results_per_query,
-                                                 year_from, sort_mode="cited")
-                    if cited_res:
-                        source = "openalex"
-                        print("[检索Agent] S2不可用, 数据源切换: "
-                              "OpenAlex双路检索")
-                    else:
-                        source = "arxiv"
-                        print("[检索Agent] S2/OpenAlex均不可用, "
-                              "数据源切换: arXiv官方API")
-                        cited_res = _arxiv_search(kw, results_per_query)
+                    source = "arxiv"
+                    print("[检索Agent] S2/OpenAlex均不可用, "
+                          "数据源切换: arXiv官方API")
+                    cited_res = _arxiv_search(kw, results_per_query)
         elif source == "openalex":
             cited_res = _openalex_search(kw, results_per_query, year_from,
                                          sort_mode="cited")
@@ -1374,16 +1519,14 @@ def _arxiv_rescue(p: PaperMeta) -> bool:
         "search_query": query,
         "max_results": 3,  # 取前3条逐一比对标题
     }
-    try:
-        resp = requests.get(ARXIV_API_BASE, params=params, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[检索Agent] 救援查询失败: {e}")
+    xml_text = _arxiv_request(params)  # 复用带缓存的arXiv查询入口
+    if xml_text is None:
+        print("[检索Agent] 救援查询失败: arXiv API不可达")
         return False
 
     ns = {"a": "http://www.w3.org/2005/Atom"}
     try:
-        root = ET.fromstring(resp.text)
+        root = ET.fromstring(xml_text)
     except ET.ParseError:
         return False
 
