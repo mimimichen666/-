@@ -34,3 +34,6 @@ Thumbs.db
 # ---- 临时诊断文件 ----
 oa_status.txt
 *.log
+
+# 本地测试脚本（开发期调试用，不入仓库）
+test_*.py
